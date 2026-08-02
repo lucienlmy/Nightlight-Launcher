@@ -1,4 +1,4 @@
-# 🌌 Nightlight Game Launcher (V5)
+# 🌌 Nightlight Launcher (V5)
 
 <p align="center">
   <strong>Lightweight Electron app to manage your Steam library. Switch accounts, apply bypasses, and launch games.</strong>
