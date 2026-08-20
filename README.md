@@ -1,11 +1,11 @@
-# 🌌 Nightlight Launcher (V5)
+# 🌌 Nightlight Launcher
 
 <p align="center">
   <strong>Lightweight Electron app to manage your Steam library. Switch accounts, apply bypasses, and launch games.</strong>
 </p>
 
 <p align="center">
-  <img src="SCRS/NLGLV5Final.png" width="700">
+  <img src="SCRS/NLGLV5.2.7.png" width="700">
 </p>
 
 <p align="center">
@@ -16,7 +16,7 @@
 
 ---
 
-## ✨ What’s inside V5
+## ✨ What’s inside V5.2.7
 
 - **Game Library & Accounts** – Browse your available games, instantly log in, and launch Steam seamlessly.
 - **Bypass Manager** – View all supported titles, set custom game paths, and inject/verify bypasses with progress feedback.
@@ -30,7 +30,7 @@
 2. **Enter your access key** – required to unlock the launcher.
 3. **Use the sidebar** to navigate between Home, Accounts, and Bypass.
 
-> 📺 **V5 tutorial** – coming soon (once I’ve finished building it!).
+> 📺 **V5 tutorial** – coming soon.
 
 ---
 
