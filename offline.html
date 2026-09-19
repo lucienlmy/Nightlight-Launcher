@@ -1,0 +1,621 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Nightlight Launcher — Connection Lost</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #06040a;
+      --surface: #100b13;
+      --card: #17101b;
+      --pink: #e84393;
+      --pink-light: #fd79a8;
+      --pink-soft: #a855f7;
+      --text: #f4edf5;
+      --muted: #a18ea6;
+      --border: rgba(232, 67, 147, 0.22);
+      --border-soft: rgba(232, 67, 147, 0.12);
+      --discord: #5865f2;
+      --discord-hover: #6875f5;
+      --yellow: #fbbf24;
+      --danger: #fb7185;
+      --font-ui: "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, Arial, sans-serif;
+      --font-mono: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; min-height: 100%; margin: 0; }
+    body {
+      overflow-x: hidden;
+      overflow-y: auto;
+      display: grid;
+      place-items: center;
+      padding: 42px 20px 52px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-ui);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ---------- Animated background ---------- */
+    .bg {
+      position: fixed; inset: 0;
+      overflow: hidden;
+      pointer-events: none;
+      z-index: -1;
+    }
+    .bg-grid {
+      position: absolute; inset: 0;
+      background:
+        linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px);
+      background-size: 38px 38px;
+      mask-image: linear-gradient(to bottom, rgba(0,0,0,0.9), transparent 88%);
+      -webkit-mask-image: linear-gradient(to bottom, rgba(0,0,0,0.9), transparent 88%);
+    }
+    .orb {
+      position: absolute;
+      width: 480px; height: 480px;
+      border-radius: 50%;
+      filter: blur(90px);
+      opacity: 0.22;
+      animation: orbFloat 16s ease-in-out infinite alternate;
+    }
+    .orb.pink   { background: var(--pink);        top: -160px; left: -120px; }
+    .orb.purple { background: var(--pink-soft);   bottom: -180px; right: -140px; animation-delay: -6s; opacity: 0.18; }
+    .orb.discord{ background: var(--discord);     top: 40%; right: 8%;        animation-delay: -11s; opacity: 0.12; width: 340px; height: 340px; }
+    @keyframes orbFloat {
+      from { transform: translate3d(0,0,0) scale(1); }
+      to   { transform: translate3d(60px, 40px, 0) scale(1.15); }
+    }
+
+    /* ---------- Window drag strip ---------- */
+    .window-drag {
+      position: fixed;
+      inset: 0 0 auto;
+      height: 42px;
+      -webkit-app-region: drag;
+      z-index: 10;
+    }
+
+    /* ---------- Panel ---------- */
+    .panel {
+      position: relative;
+      width: min(640px, 100%);
+      padding: 38px 40px 32px;
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      background: linear-gradient(180deg, rgba(23,16,27,0.92), rgba(15,10,18,0.94));
+      backdrop-filter: blur(22px);
+      -webkit-backdrop-filter: blur(22px);
+      box-shadow:
+        0 34px 90px rgba(0,0,0,0.62),
+        0 0 60px rgba(232,67,147,0.08),
+        0 0 0 1px rgba(255,255,255,0.02) inset;
+      text-align: center;
+      animation: panelIn 0.7s cubic-bezier(0.16, 1, 0.3, 1) both;
+    }
+    @keyframes panelIn {
+      from { opacity: 0; transform: translateY(24px) scale(0.98); }
+      to   { opacity: 1; transform: none; }
+    }
+
+    /* ---------- Logo ---------- */
+    .logo {
+      position: relative;
+      width: 82px; height: 82px;
+      margin: 0 auto 22px;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      background: rgba(232,67,147,0.08);
+      box-shadow: 0 0 38px rgba(232,67,147,0.20);
+      animation: logoPulse 3.6s ease-in-out infinite;
+    }
+    .logo::after {
+      content: "";
+      position: absolute;
+      inset: -6px;
+      border-radius: 24px;
+      border: 1px solid rgba(232,67,147,0.28);
+      opacity: 0;
+      animation: logoRipple 3.6s ease-out infinite;
+    }
+    .logo img {
+      width: 60px; height: 60px;
+      object-fit: contain;
+      filter: drop-shadow(0 0 12px rgba(253,121,168,0.45));
+    }
+    @keyframes logoPulse {
+      0%, 100% { transform: scale(1);    box-shadow: 0 0 38px rgba(232,67,147,0.20); }
+      50%      { transform: scale(1.03); box-shadow: 0 0 52px rgba(232,67,147,0.30); }
+    }
+    @keyframes logoRipple {
+      0%   { opacity: 0.7; transform: scale(1); }
+      70%  { opacity: 0;   transform: scale(1.25); }
+      100% { opacity: 0;   transform: scale(1.25); }
+    }
+
+    /* ---------- Status badge ---------- */
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      margin-bottom: 16px;
+      padding: 6px 14px;
+      border-radius: 999px;
+      background: rgba(232,67,147,0.08);
+      border: 1px solid rgba(232,67,147,0.25);
+      color: var(--pink-light);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+    .status::before {
+      content: "";
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--pink);
+      box-shadow: 0 0 12px var(--pink);
+      animation: dotBlink 1.6s ease-in-out infinite;
+    }
+    @keyframes dotBlink {
+      0%, 100% { opacity: 1;   transform: scale(1); }
+      50%      { opacity: 0.4; transform: scale(0.8); }
+    }
+
+    /* ---------- Typography ---------- */
+    h1 {
+      margin: 0;
+      font-size: clamp(26px, 4.6vw, 36px);
+      line-height: 1.1;
+      letter-spacing: -0.02em;
+      background: linear-gradient(120deg, #ffffff 0%, #fbc3de 45%, #d8b4fe 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-size: 200% 100%;
+      animation: textShift 6s ease-in-out infinite alternate;
+    }
+    @keyframes textShift {
+      from { background-position: 0% 50%; }
+      to   { background-position: 100% 50%; }
+    }
+    .lead {
+      max-width: 480px;
+      margin: 16px auto 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.65;
+    }
+
+    /* ---------- Actions ---------- */
+    .actions {
+      display: flex;
+      justify-content: center;
+      gap: 10px;
+      margin-top: 26px;
+      flex-wrap: wrap;
+    }
+    button {
+      position: relative;
+      min-height: 46px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0 20px;
+      color: #fff;
+      font-family: inherit;
+      font-size: 13.5px;
+      font-weight: 750;
+      cursor: pointer;
+      transition: transform 0.18s ease, background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+      -webkit-app-region: no-drag;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+    button:hover { transform: translateY(-2px); }
+    button:active { transform: translateY(0); }
+    button svg { width: 15px; height: 15px; flex: none; }
+
+    .discord {
+      background: var(--discord);
+      border-color: rgba(255,255,255,0.16);
+      box-shadow: 0 10px 28px rgba(88,101,242,0.28);
+    }
+    .discord:hover {
+      background: var(--discord-hover);
+      box-shadow: 0 14px 34px rgba(88,101,242,0.42);
+    }
+    .retry {
+      background: rgba(232,67,147,0.11);
+      color: var(--pink-light);
+    }
+    .retry:hover {
+      background: var(--pink);
+      color: #fff;
+      border-color: var(--pink);
+      box-shadow: 0 12px 30px rgba(232,67,147,0.34);
+    }
+
+    /* ---------- Common Problems ---------- */
+    .problems {
+      margin-top: 34px;
+      text-align: left;
+      border-top: 1px solid var(--border-soft);
+      padding-top: 26px;
+    }
+    .problems-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 16px;
+      color: var(--pink-light);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+    .problems-head::after {
+      content: "";
+      flex: 1;
+      height: 1px;
+      background: linear-gradient(90deg, rgba(232,67,147,0.25), transparent);
+    }
+
+    .problem {
+      border: 1px solid var(--border-soft);
+      border-radius: 12px;
+      background: rgba(255,255,255,0.015);
+      margin-bottom: 10px;
+      overflow: hidden;
+      transition: border-color 0.22s ease, background 0.22s ease, box-shadow 0.22s ease;
+      animation: problemIn 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+    }
+    .problem:nth-child(2) { animation-delay: 0.06s; }
+    .problem:nth-child(3) { animation-delay: 0.12s; }
+    .problem:nth-child(4) { animation-delay: 0.18s; }
+    @keyframes problemIn {
+      from { opacity: 0; transform: translateX(-8px); }
+      to   { opacity: 1; transform: none; }
+    }
+    .problem:hover { border-color: rgba(232,67,147,0.35); background: rgba(232,67,147,0.03); }
+    .problem[open] {
+      background: rgba(232,67,147,0.05);
+      border-color: rgba(232,67,147,0.4);
+      box-shadow: 0 8px 24px rgba(232,67,147,0.08);
+    }
+
+    .problem summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 15px 18px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 13.5px;
+      font-weight: 700;
+      color: var(--text);
+      user-select: none;
+    }
+    .problem summary::-webkit-details-marker { display: none; }
+
+    .problem-icon {
+      width: 26px; height: 26px;
+      flex: none;
+      display: grid;
+      place-items: center;
+      border-radius: 8px;
+      background: rgba(232,67,147,0.12);
+      border: 1px solid rgba(232,67,147,0.25);
+      color: var(--pink-light);
+      transition: transform 0.3s ease, background 0.3s ease;
+    }
+    .problem-icon svg { width: 13px; height: 13px; }
+    .problem[open] .problem-icon {
+      background: var(--pink);
+      color: #fff;
+      transform: rotate(6deg) scale(1.06);
+    }
+
+    .problem-title { flex: 1; }
+
+    .chev {
+      width: 16px; height: 16px;
+      flex: none;
+      color: var(--muted);
+      transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1), color 0.2s ease;
+    }
+    .problem[open] .chev { transform: rotate(180deg); color: var(--pink-light); }
+
+    .problem-body {
+      padding: 0 18px 18px 56px;
+      font-size: 13px;
+      line-height: 1.65;
+      color: var(--muted);
+      animation: bodyFade 0.35s ease both;
+    }
+    @keyframes bodyFade {
+      from { opacity: 0; transform: translateY(-4px); }
+      to   { opacity: 1; transform: none; }
+    }
+    .problem-body strong { color: var(--text); font-weight: 700; }
+    .problem-body code {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      padding: 2px 6px;
+      border-radius: 5px;
+      background: rgba(0,0,0,0.3);
+      border: 1px solid var(--border-soft);
+      color: var(--pink-light);
+    }
+
+    /* Tips inside a problem body */
+    .tips {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .tip {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      padding: 10px 12px;
+      border-radius: 9px;
+      background: rgba(255,255,255,0.02);
+      border: 1px solid rgba(255,255,255,0.04);
+      font-size: 12.5px;
+      line-height: 1.55;
+      transition: background 0.2s ease, border-color 0.2s ease;
+    }
+    .tip:hover {
+      background: rgba(232,67,147,0.05);
+      border-color: rgba(232,67,147,0.22);
+    }
+    .tip-mark {
+      flex: none;
+      width: 20px; height: 20px;
+      border-radius: 6px;
+      display: grid;
+      place-items: center;
+      font-size: 11px;
+      font-weight: 800;
+      background: rgba(232,67,147,0.14);
+      color: var(--pink-light);
+    }
+    .tip-text { flex: 1; }
+    .tip-text b { color: var(--text); }
+    .tip.highlight {
+      background: linear-gradient(135deg, rgba(232,67,147,0.09), rgba(168,85,247,0.06));
+      border-color: rgba(232,67,147,0.3);
+    }
+    .tip.highlight .tip-mark {
+      background: linear-gradient(135deg, var(--pink), var(--pink-soft));
+      color: #fff;
+    }
+
+    /* ---------- Footer ---------- */
+    .foot {
+      margin-top: 26px;
+      padding-top: 18px;
+      border-top: 1px solid var(--border-soft);
+      color: #6c5f72;
+      font-size: 11px;
+      font-family: var(--font-mono);
+      letter-spacing: 0.04em;
+    }
+
+    /* ---------- Responsive ---------- */
+    @media (max-width: 560px) {
+      body { padding: 30px 14px 40px; }
+      .panel { padding: 28px 20px 22px; border-radius: 18px; }
+      .logo { width: 68px; height: 68px; margin-bottom: 18px; }
+      .logo img { width: 48px; height: 48px; }
+      .actions { display: grid; }
+      button { width: 100%; }
+      .problem-body { padding-left: 18px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition: none !important;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <div class="window-drag" aria-hidden="true"></div>
+
+  <div class="bg" aria-hidden="true">
+    <div class="bg-grid"></div>
+    <div class="orb pink"></div>
+    <div class="orb purple"></div>
+    <div class="orb discord"></div>
+  </div>
+
+  <main class="panel">
+
+    <div class="logo">
+      <img src="assets/icon.png" alt="Nightlight">
+    </div>
+
+    <div class="status">Connection Lost</div>
+
+    <h1>Nightlight can't reach the server</h1>
+
+    <p class="lead">
+      Your internet connection is working, but the launcher service can't be contacted right now.
+      Join the Discord for live status, or check the fixes below.
+    </p>
+
+    <div class="actions">
+      <button class="discord" id="discordButton" type="button">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <path d="M20.317 4.37a19.79 19.79 0 0 0-4.885-1.515.074.074 0 0 0-.079.037 13.7 13.7 0 0 0-.617 1.27 18.27 18.27 0 0 0-5.487 0 12.6 12.6 0 0 0-.625-1.27.077.077 0 0 0-.079-.037A19.74 19.74 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.2 14.2 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.1 13.1 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.128 12.3 12.3 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.84 19.84 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03ZM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418Zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418Z"/>
+        </svg>
+        Open Discord server
+      </button>
+      <button class="retry" id="retryButton" type="button">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M20 6v5h-5M4 18v-5h5"/>
+          <path d="M18.5 9A7 7 0 0 0 6 6.5L4 11M5.5 15A7 7 0 0 0 18 17.5l2-4.5"/>
+        </svg>
+        Try again
+      </button>
+    </div>
+
+    <!-- =================== COMMON PROBLEMS =================== -->
+    <section class="problems">
+      <div class="problems-head">Common Problems</div>
+
+      <!-- 1. DNS -->
+      <details class="problem" open>
+        <summary>
+          <span class="problem-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/>
+            </svg>
+          </span>
+          <span class="problem-title">DNS problem — can't resolve <code>nl.onajlikezz.xyz</code></span>
+          <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+        </summary>
+        <div class="problem-body">
+          Your router or ISP is refusing to translate the domain name into a server address. This is the most common reason the launcher suddenly stops connecting on an otherwise working network.
+          <div class="tips">
+            <div class="tip highlight">
+              <span class="tip-mark">1</span>
+              <div class="tip-text"><b>Turn on a VPN.</b> Even a free one like ProtonVPN or Cloudflare WARP routes your DNS through a different resolver and usually fixes it instantly.</div>
+            </div>
+            <div class="tip highlight">
+              <span class="tip-mark">2</span>
+              <div class="tip-text"><b>Use your phone's hotspot.</b> Turn on mobile data on your phone, enable the hotspot, and connect the PC to it. This bypasses your home network's DNS entirely. Once the launcher loads, switch back to your normal Wi-Fi.</div>
+            </div>
+            <div class="tip">
+              <span class="tip-mark">3</span>
+              <div class="tip-text">Change your PC's DNS to <code>1.1.1.1</code> and <code>1.0.0.1</code> (Cloudflare) or <code>8.8.8.8</code> (Google), then run <code>ipconfig /flushdns</code> in Command Prompt.</div>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <!-- 2. Firewall / Antivirus -->
+      <details class="problem">
+        <summary>
+          <span class="problem-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            </svg>
+          </span>
+          <span class="problem-title">Firewall or antivirus is blocking the launcher</span>
+          <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+        </summary>
+        <div class="problem-body">
+          Windows Defender, third-party antivirus, or a corporate firewall may be silently blocking outbound HTTPS traffic from Electron.
+          <div class="tips">
+            <div class="tip">
+              <span class="tip-mark">•</span>
+              <div class="tip-text">Open <b>Windows Security → Firewall & network protection → Allow an app through firewall</b> and add <code>Nightlight Launcher</code> for both Private and Public networks.</div>
+            </div>
+            <div class="tip">
+              <span class="tip-mark">•</span>
+              <div class="tip-text">Temporarily disable third-party antivirus (Avast, Kaspersky, Malwarebytes) and retry. If it works, add an exclusion for the launcher folder.</div>
+            </div>
+            <div class="tip">
+              <span class="tip-mark">•</span>
+              <div class="tip-text">On a work or school network? Try a personal connection — many block non-standard traffic by policy.</div>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <!-- 3. Server-side outage -->
+      <details class="problem">
+        <summary>
+          <span class="problem-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+            </svg>
+          </span>
+          <span class="problem-title">The server itself is down or under maintenance</span>
+          <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+        </summary>
+        <div class="problem-body">
+          If everyone is affected and Discord is quiet, it's usually our side. We post status updates and ETA in the announcement channel.
+          <div class="tips">
+            <div class="tip">
+              <span class="tip-mark">•</span>
+              <div class="tip-text">Check the <b>#announcements</b> channel in the Discord server — we always post before restarts.</div>
+            </div>
+            <div class="tip">
+              <span class="tip-mark">•</span>
+              <div class="tip-text">Try again in 5–10 minutes. Most outages are short.</div>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <!-- 4. Wrong system time -->
+      <details class="problem">
+        <summary>
+          <span class="problem-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>
+            </svg>
+          </span>
+          <span class="problem-title">System clock is out of sync</span>
+          <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+        </summary>
+        <div class="problem-body">
+          If your computer's date or time is off by more than a few minutes, HTTPS handshakes fail and the launcher can't reach any server at all.
+          <div class="tips">
+            <div class="tip">
+              <span class="tip-mark">•</span>
+              <div class="tip-text">Right-click the clock → <b>Adjust date and time</b> → turn on <b>Set time automatically</b> and <b>Set time zone automatically</b>.</div>
+            </div>
+            <div class="tip">
+              <span class="tip-mark">•</span>
+              <div class="tip-text">Then click <b>Sync now</b> and retry the launcher.</div>
+            </div>
+          </div>
+        </div>
+      </details>
+    </section>
+
+    <div class="foot">Nightlight Launcher v5.2.9</div>
+
+  </main>
+
+  <script>
+    document.getElementById('discordButton').addEventListener('click', () => {
+      if (window.nightlight && window.nightlight.openExternal) {
+        window.nightlight.openExternal('https://discord.gg/KrfzAgtbms');
+      }
+    });
+    document.getElementById('retryButton').addEventListener('click', () => {
+      if (window.nightlight && window.nightlight.retryConnection) {
+        window.nightlight.retryConnection();
+      }
+    });
+
+    // Accordion behaviour — only one problem open at a time
+    const problems = document.querySelectorAll('details.problem');
+    problems.forEach((item) => {
+      item.addEventListener('toggle', () => {
+        if (item.open) {
+          problems.forEach((other) => {
+            if (other !== item && other.open) other.open = false;
+          });
+        }
+      });
+    });
+  </script>
+</body>
+</html>

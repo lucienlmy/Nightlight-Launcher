@@ -1,701 +1,1185 @@
-// main.js (with Steam auto‑detection, cross‑platform zip, batching & better error reporting)
-const { app, BrowserWindow, ipcMain, shell, net, dialog } = require('electron');
-const { execSync, spawn } = require('child_process');
+'use strict';
+
+const { app, BrowserWindow, ipcMain, shell, session, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const https = require('https');
-const os = require('os');
-const { exec } = require('child_process');
-const SteamUser = require('steam-user');
+const { execFile, spawn } = require('child_process');
 
-// Disable GPU cache if you want
-app.commandLine.appendSwitch('disable-gpu-cache');
+const APP_URL = 'https://nl.onajlikezz.xyz/app/v529/index.php';
+const APP_ORIGIN = getAppOrigin(APP_URL);
+const OFFLINE_FILE = path.join(__dirname, 'offline.html');
+let mainWindow = null;
+let keyWindow = null;
+let steamPathPromise = null;
+let loadingOfflinePage = false;
 
-// ⬇️ Fix the disk cache errors
-app.setPath('userData', path.join(os.homedir(), 'AppData', 'Local', 'nightlight-launcher'));
-app.commandLine.appendSwitch('disable-devtools');
-
-let mainWindow;
-let detectedSteamPath = 'C:\\Program Files (x86)\\Steam'; // default fallback (Windows)
-const langFilePath = path.join(app.getPath('userData'), 'language.txt');
-
-// ── Sanitize game name for use in folder names ──────────────────────
-function sanitizeForPath(name) {
-  return name.replace(/[<>:"/\\|?*]/g, '_');
-}
-
-// ── Cross‑platform zip extraction (prefers adm‑zip, falls back to PowerShell) ──
-let extractZip;
-try {
-  const AdmZip = require('adm-zip');
-  extractZip = (zipPath, destDir) => {
-    const zip = new AdmZip(zipPath);
-    zip.extractAllTo(destDir, true);
-  };
-} catch (_) {
-  // Fallback for Windows only if adm‑zip isn’t installed
-  extractZip = (zipPath, destDir) => {
-    if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
-    execSync(`powershell -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${destDir}' -Force"`, { stdio: 'ignore' });
-  };
-}
-
-// ── File download with redirect support ─────────────────────────────
-function downloadFile(urlStr, destPath, onProgress) {
-  return new Promise((resolve, reject) => {
-    const dir = path.dirname(destPath);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-
-    const request = net.request(urlStr);
-    request.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)');
-    request.setHeader('Accept', '*/*');
-
-    let lastProgressTime = 0;
-    const THROTTLE_MS = 500;
-
-    request.on('response', (response) => {
-      if ([301, 302, 307, 308].includes(response.statusCode) && response.headers.location) {
-        return downloadFile(response.headers.location, destPath, onProgress)
-          .then(resolve).catch(reject);
-      }
-
-      if (response.statusCode !== 200) {
-        return reject(new Error(`HTTP ${response.statusCode}`));
-      }
-
-      const totalSize = parseInt(response.headers['content-length'], 10);
-      let downloaded = 0;
-      const file = fs.createWriteStream(destPath);
-
-      response.on('data', (chunk) => {
-        downloaded += chunk.length;
-        file.write(chunk);
-
-        const now = Date.now();
-        if (totalSize > 0 && now - lastProgressTime >= THROTTLE_MS && onProgress) {
-          lastProgressTime = now;
-          const percent = Math.floor((downloaded / totalSize) * 100);
-          onProgress(percent);
-        }
-      });
-
-      response.on('end', () => {
-        file.end(() => {
-          if (onProgress) onProgress(100);
-          resolve();
-        });
-      });
-
-      response.on('error', (err) => {
-        file.end();
-        fs.unlink(destPath, () => {});
-        reject(err);
-      });
-
-      file.on('error', (err) => {
-        file.end();
-        fs.unlink(destPath, () => {});
-        reject(err);
-      });
-    });
-
-    request.on('error', reject);
-    request.end();
-  });
-}
-
-ipcMain.handle('get-app-version', () => app.getVersion());
-
-// ── Steam auto‑detection (hardened) ──────────────────────────────────
-function getSteamInstallPath() {
-  // Windows registry
+function getAppOrigin(value) {
+  let parsed;
   try {
-    const regOutput = execSync(
-      'reg query "HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\Valve\\Steam" /v InstallPath',
-      { encoding: 'utf8' }
-    );
-    const match = regOutput.match(/REG_SZ\s+(.+)/i);
-    if (match && match[1]) {
-      const p = match[1].trim();
-      if (fs.existsSync(p)) return p;
-    }
-  } catch (_) { /* registry read failed */ }
-  // Fallback for other OS – use common paths
-  const platform = os.platform();
-  if (platform === 'win32') {
-    const defaultPath = 'C:\\Program Files (x86)\\Steam';
-    if (fs.existsSync(defaultPath)) return defaultPath;
-  } else if (platform === 'darwin') {
-    const defaultPath = path.join(os.homedir(), 'Library', 'Application Support', 'Steam');
-    if (fs.existsSync(defaultPath)) return defaultPath;
-  } else if (platform === 'linux') {
-    const defaultPath = path.join(os.homedir(), '.steam', 'steam');
-    if (fs.existsSync(defaultPath)) return defaultPath;
-  }
-  return null;
-}
-
-// ── Language persistence ──
-ipcMain.handle('get-language', () => {
-  try {
-    return fs.readFileSync(langFilePath, 'utf8').trim() || 'en';
+    parsed = new URL(value);
   } catch {
-    return 'en';
+    throw new Error('NIGHTLIGHT_APP_URL must be a valid URL.');
   }
-});
+  if (!['https:', 'http:'].includes(parsed.protocol)) {
+    throw new Error('NIGHTLIGHT_APP_URL must use HTTPS.');
+  }
+  if (parsed.protocol !== 'https:' && !isLocalOrigin(parsed.origin)) {
+    throw new Error('HTTP is allowed only for localhost development.');
+  }
+  return parsed.origin;
+}
 
-ipcMain.handle('set-language', (event, lang) => {
-  fs.writeFileSync(langFilePath, lang, 'utf8');
-  return true;
-});
-
-// ── Load locale JSON from the 'locales' folder ──
-ipcMain.handle('get-locale-data', (event, lang) => {
-  const filePath = path.join(__dirname, 'locales', `${lang}.json`);
-  const raw = fs.readFileSync(filePath, 'utf8');
-  return JSON.parse(raw);
-});
-
-function getSteamLibraryFolders(steamPath) {
-  const libraries = [];
-  if (!steamPath) return libraries;
-  if (fs.existsSync(steamPath)) libraries.push(steamPath);
-  const vdfPath = path.join(steamPath, 'steamapps', 'libraryfolders.vdf');
-  if (!fs.existsSync(vdfPath)) return libraries;
+function isLocalOrigin(origin) {
   try {
-    const content = fs.readFileSync(vdfPath, 'utf8');
-    const regex = /"path"\s+"([^"]+)"/g;
-    let match;
-    while ((match = regex.exec(content)) !== null) {
-      let libPath = match[1].replace(/\\\\/g, '\\');
-      if (fs.existsSync(libPath) && !libraries.includes(libPath)) {
-        libraries.push(libPath);
-      }
+    return ['localhost', '127.0.0.1', '[::1]'].includes(new URL(origin).hostname);
+  } catch {
+    return false;
+  }
+}
+
+// ---------- Paths ----------
+const LOCATIONS_FILE  = () => path.join(app.getPath('userData'), 'game_locations.json');
+const STEAM_PATH_FILE = () => path.join(app.getPath('userData'), 'steam_path.txt');
+
+// ---------- Windows exclusion marker ----------
+// Marker file name written into the game folder when an exclusion is added.
+// If it exists, the UI shows "Remove from exclusions".
+const EXCLUSION_MARKER = 'nl.winexc';
+
+function hasExclusionMarker(folderPath) {
+  try {
+    if (!folderPath) return false;
+    return fs.existsSync(path.join(folderPath, EXCLUSION_MARKER));
+  } catch {
+    return false;
+  }
+}
+
+function writeExclusionMarker(folderPath) {
+  try {
+    const markerPath = path.join(folderPath, EXCLUSION_MARKER);
+    fs.writeFileSync(
+      markerPath,
+      'Nightlight Defender exclusion marker\n' + new Date().toISOString() + '\n',
+      'utf8'
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function removeExclusionMarker(folderPath) {
+  try {
+    const markerPath = path.join(folderPath, EXCLUSION_MARKER);
+    if (fs.existsSync(markerPath)) fs.unlinkSync(markerPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ---------- Elevated PowerShell (UAC prompt) ----------
+/**
+ * Runs an inner PowerShell script in an elevated child process.
+ * Windows shows the standard UAC "Do you want to allow...?" prompt.
+ *
+ * Resolves with:
+ *   { ok: true }
+ *   { ok: false, error: 'uac_denied' }               → user clicked "No"
+ *   { ok: false, error: 'unsupported' }              → non-Windows
+ *   { ok: false, error: 'temp_write_failed', message }
+ *   { ok: false, error: 'failed', message }          → inner script errored
+ */
+function runElevatedPowerShell(innerScript, timeoutMs = 120000) {
+  return new Promise((resolve) => {
+    if (process.platform !== 'win32') {
+      return resolve({ ok: false, error: 'unsupported' });
     }
-  } catch (_) {}
-  return libraries;
-}
 
-// ── Access key storage ──────────────────────────────────────────────
-const keyFilePath = path.join(os.homedir(), 'AppData', 'Local', 'nightlight-launcher', 'access_key.txt');
-function saveKeyToFile(key) {
-  const dir = path.dirname(keyFilePath);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(keyFilePath, key, 'utf8');
-}
-function getSavedKey() {
-  try {
-    if (fs.existsSync(keyFilePath)) return fs.readFileSync(keyFilePath, 'utf8').trim();
-  } catch {}
-  return null;
-}
+    // Write the inner script to a temp file so we don't have to escape
+    // nested quotes into a single -Command string.
+    const tmpDir = app.getPath('temp');
+    const tmpFile = path.join(
+      tmpDir,
+      `nl-elev-${Date.now()}-${Math.random().toString(36).slice(2)}.ps1`
+    );
 
-// ── Bypass API integration ──────────────────────────────────────────
-let bypassGameData = null;
-const BYPASS_BASE_URL = 'https://onajlikezz.xyz/api/bypass.php';
-const DOWNLOAD_BASE_URL = 'https://onajlikezz.xyz/api/downloadManager.php';
+    const wrapped = `
+$ErrorActionPreference = 'Stop'
+try {
+  ${innerScript}
+  exit 0
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
+}
+`;
 
-function httpGetText(url) {
-  return new Promise((resolve, reject) => {
-    https.get(url, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        if (res.statusCode === 200) {
-          resolve(data.trim());
-        } else {
-          reject(new Error(`HTTP ${res.statusCode}`));
+    try {
+      fs.writeFileSync(tmpFile, wrapped, 'utf8');
+    } catch (e) {
+      return resolve({ ok: false, error: 'temp_write_failed', message: e.message });
+    }
+
+    // Outer script: launch the inner script elevated via Start-Process -Verb RunAs.
+    // -Wait + -PassThru lets us read the child's exit code.
+    // If the user clicks "No" on the UAC prompt, Start-Process throws with
+    // HResult 0x800704C7 (ERROR_CANCELLED = 1223). We surface that as exit 1223.
+    const outerScript = `
+try {
+  $proc = Start-Process -FilePath 'powershell.exe' ` +
+      `-ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','${tmpFile.replace(/'/g, "''")}') ` +
+      `-Verb RunAs -WindowStyle Hidden -PassThru -Wait -ErrorAction Stop
+  exit $proc.ExitCode
+} catch {
+  if ($_.Exception.HResult -eq -2147023673) { exit 1223 }
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
+}
+`;
+
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', outerScript],
+      { windowsHide: true, timeout: timeoutMs },
+      (error, stdout, stderr) => {
+        try { fs.unlinkSync(tmpFile); } catch {}
+
+        if (error) {
+          const code = typeof error.code === 'number' ? error.code : 0;
+          const combined = (String(stderr || '') + ' ' + String(error.message || '')).trim();
+
+          if (
+            code === 1223 ||
+            /\b1223\b/.test(combined) ||
+            /canceled by the user/i.test(combined) ||
+            /operation was canceled/i.test(combined)
+          ) {
+            return resolve({ ok: false, error: 'uac_denied' });
+          }
+
+          return resolve({
+            ok: false,
+            error: 'failed',
+            message: combined.slice(0, 500) || 'Unknown PowerShell error',
+          });
         }
-      });
-    }).on('error', reject);
+
+        resolve({ ok: true });
+      }
+    );
   });
 }
 
-async function loadBypassData() {
-  if (bypassGameData) return bypassGameData;
-  const key = getSavedKey();
-  if (!key) {
-    console.warn('No access key, cannot load bypass data');
-    bypassGameData = [];
-    return bypassGameData;
-  }
+// ---------- Steam helpers ----------
+async function findSteamPath() {
   try {
-    const url = `${BYPASS_BASE_URL}?key=${encodeURIComponent(key)}`;
-    const raw = await httpGetText(url);
-    bypassGameData = JSON.parse(raw);
-    console.log('Bypass games loaded:', bypassGameData.length);
-  } catch (e) {
-    console.error('Failed to load bypass data:', e);
-    bypassGameData = [];
-  }
-  return bypassGameData;
-}
-
-function getBypassDownloadUrl(steamAppId) {
-  const key = getSavedKey();
-  if (!key) return null;
-  return `${DOWNLOAD_BASE_URL}?key=${encodeURIComponent(key)}&id=${steamAppId}`;
-}
-
-ipcMain.handle('get-bypass-download-url', async (event, steamAppId) => {
-  return getBypassDownloadUrl(steamAppId);
-});
-
-// ── Custom paths (persistent per‑game paths) ────────────────────────
-const customPathsFile = path.join(os.homedir(), 'AppData', 'Local', 'nightlight-launcher', 'custom_paths.json');
-function loadCustomPaths() {
-  try {
-    if (fs.existsSync(customPathsFile)) return JSON.parse(fs.readFileSync(customPathsFile, 'utf8'));
+    if (fs.existsSync(STEAM_PATH_FILE())) {
+      const saved = fs.readFileSync(STEAM_PATH_FILE(), 'utf8').trim();
+      if (saved && fs.existsSync(saved)) return saved;
+    }
   } catch (e) {}
-  return {};
-}
-function saveCustomPaths(data) {
-  const dir = path.dirname(customPathsFile);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(customPathsFile, JSON.stringify(data, null, 2));
+
+  if (steamPathPromise) return steamPathPromise;
+  steamPathPromise = (async () => {
+    if (process.platform !== 'win32') return null;
+    const registryPaths = await Promise.all([
+      queryRegistry('HKCU\\Software\\Valve\\Steam', 'SteamPath'),
+      queryRegistry('HKLM\\SOFTWARE\\WOW6432Node\\Valve\\Steam', 'InstallPath'),
+      queryRegistry('HKLM\\SOFTWARE\\Valve\\Steam', 'InstallPath'),
+    ]);
+    const candidates = [...new Set([
+      ...registryPaths,
+      'C:\\Program Files (x86)\\Steam',
+      'C:\\Program Files\\Steam',
+    ].filter(Boolean))];
+    for (const candidate of candidates) {
+      try {
+        if (fs.existsSync(path.join(candidate, 'steam.exe'))) return candidate;
+      } catch { }
+    }
+    return null;
+  })();
+  return steamPathPromise;
 }
 
-// ── Window Creation ─────────────────────────────────────────────────
+function isAllowedAppUrl(value) {
+  try {
+    const parsed = new URL(value);
+    return parsed.origin === APP_ORIGIN && ['https:', 'http:'].includes(parsed.protocol);
+  } catch {
+    return false;
+  }
+}
+
+function isAllowedExternalUrl(value) {
+  try {
+    return ['https:', 'http:'].includes(new URL(value).protocol);
+  } catch {
+    return false;
+  }
+}
+
+function isAllowedDiscordOauthUrl(value) {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'https:' && parsed.hostname === 'discord.com';
+  } catch {
+    return false;
+  }
+}
+
+function isOfflineFileUrl(value) {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'file:' && path.resolve(decodeURIComponent(parsed.pathname.replace(/^\/(?:([a-zA-Z]:))/i, '$1'))) === path.resolve(OFFLINE_FILE);
+  } catch {
+    return false;
+  }
+}
+
+function senderIsMain(event) {
+  const senderWindow = BrowserWindow.fromWebContents(event.sender);
+  return Boolean(senderWindow && senderWindow === mainWindow);
+}
+
+function showMainWindow() {
+  if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+    mainWindow.show();
+  }
+}
+
+function loadOfflinePage(errorCode, description) {
+  if (!mainWindow || mainWindow.isDestroyed() || loadingOfflinePage) return;
+  console.error(`Nightlight is loading offline.html: ${description || 'connection failed'} (${Number(errorCode) || 0})`);
+  loadingOfflinePage = true;
+  const loadPromise = fs.existsSync(OFFLINE_FILE)
+    ? mainWindow.loadFile(OFFLINE_FILE)
+    : Promise.reject(new Error(`Missing offline page: ${OFFLINE_FILE}`));
+  loadPromise
+    .catch((error) => console.error('Nightlight offline page failed to load:', error.message))
+    .finally(() => {
+      loadingOfflinePage = false;
+      showMainWindow();
+    });
+}
+
+function retryConnection() {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  loadingOfflinePage = false;
+  mainWindow.loadURL(APP_URL).catch((error) => loadOfflinePage(0, error.message));
+  return true;
+}
+
+function getMachineGuid() {
+  return new Promise((resolve) => {
+    if (process.platform !== 'win32') return resolve('');
+    execFile('reg', ['query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid'], {
+      windowsHide: true,
+      timeout: 5000,
+    }, (error, stdout) => {
+      if (error) return resolve('');
+      const match = String(stdout).match(/MachineGuid\s+REG_SZ\s+(.+)/i);
+      resolve(match ? match[1].trim() : '');
+    });
+  });
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1200, height: 800, minWidth: 900, minHeight: 600,
-    frame: false, transparent: true,
-    icon: path.join(__dirname, 'assets/icon.ico'),
+    width: 1280,
+    height: 820,
+    minWidth: 980,
+    minHeight: 640,
+    frame: false,
+    show: false,
+    backgroundColor: '#08060b',
+    icon: path.join(__dirname, 'assets', 'icon.png'),
     webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false,
-      devTools: false
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      devTools: !app.isPackaged,
+      spellcheck: false,
+      webSecurity: true,
+    },
+  });
+
+  mainWindow.setMenuBarVisibility(false);
+  mainWindow.once('ready-to-show', showMainWindow);
+  mainWindow.webContents.once('did-finish-load', showMainWindow);
+  const showFallback = setTimeout(showMainWindow, 5000);
+  mainWindow.once('closed', () => {
+    clearTimeout(showFallback);
+    if (keyWindow && !keyWindow.isDestroyed()) {
+      try { keyWindow.close(); } catch (e) {}
+      keyWindow = null;
     }
+    mainWindow = null;
   });
 
-  mainWindow.webContents.on('devtools-opened', () => {
-    mainWindow.webContents.closeDevTools();
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (isAllowedDiscordOauthUrl(url)) {
+      return { action: 'allow' };
+    }
+    if (isAllowedExternalUrl(url) && !isAllowedAppUrl(url)) {
+      shell.openExternal(url).catch(() => {});
+    }
+    return { action: 'deny' };
+  });
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!isAllowedAppUrl(url) && !isAllowedDiscordOauthUrl(url) && !isOfflineFileUrl(url)) event.preventDefault();
+  });
+  mainWindow.webContents.on('will-attach-webview', (event) => event.preventDefault());
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, description, validatedURL, isMainFrame) => {
+    if (!isMainFrame || errorCode === -3 || !validatedURL || isOfflineFileUrl(validatedURL)) return;
+    console.error(`Nightlight failed to load ${validatedURL}: ${description} (${errorCode})`);
+    if (isAllowedAppUrl(validatedURL)) loadOfflinePage(errorCode, description);
   });
 
-  mainWindow.loadFile('index.html');
+  async function loadAppWithMachine() {
+    const machineGuid = await getMachineGuid();
+    const url = new URL(APP_URL);
+    if (machineGuid) url.searchParams.set('machine', machineGuid);
+    mainWindow.loadURL(url.toString()).catch((error) => {
+      console.error('Nightlight initial load failed:', error);
+      loadOfflinePage(0, error.message);
+    });
+  }
+  loadAppWithMachine();
+
+  return mainWindow;
 }
 
-app.whenReady().then(() => {
-  const steamPath = getSteamInstallPath();
-  if (steamPath) {
-    detectedSteamPath = steamPath;
-    console.log('Steam detected at:', steamPath);
-  } else {
-    console.warn('Steam installation not found, using fallback path');
+function sendWindowState() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('nightlight:window-state', {
+      maximized: mainWindow.isMaximized(),
+    });
   }
-  createWindow();
-  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
-});
+}
 
-app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+function validText(value, max = 300) {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= max &&
+    !value.includes(String.fromCharCode(0))
+  );
+}
 
-// ── Title bar controls ──────────────────────────────────────────────
-ipcMain.on('minimize-app', () => mainWindow.minimize());
-ipcMain.on('maximize-app', () => mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize());
-ipcMain.on('close-app', () => mainWindow.close());
-
-// ── External link opener ────────────────────────────────────────────
-ipcMain.handle('open-external-link', async (event, url) => {
-  await shell.openExternal(url);
-  return { success: true };
-});
-
-// ── Provide bypass data ─────────────────────────────────────────────
-ipcMain.handle('get-bypass-data', async () => {
-  return await loadBypassData();
-});
-
-ipcMain.handle('save-key', async (event, key) => {
-  saveKeyToFile(key);
-  return true;
-});
-
-ipcMain.handle('get-saved-key', async () => {
-  return getSavedKey();
-});
-
-// ── Validate access key ────────────────────────────────────────────
-ipcMain.handle('validate-access-key', async (event, key) => {
+function queryRegistry(key, value) {
   return new Promise((resolve) => {
-    const url = `https://onajlikezz.xyz/api/keycheck.php?key=${encodeURIComponent(key)}`;
-    https.get(url, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          resolve(json.success === true);
-        } catch (e) {
-          resolve(false);
-        }
-      });
-    }).on('error', () => resolve(false));
-  });
-});
-
-// ── Fetch game list ─────────────────────────────────────────────────
-ipcMain.handle('get-game-list', async () => {
-  const key = getSavedKey();
-  const url = `https://onajlikezz.xyz/api/gamelist.php?key=${encodeURIComponent(key)}`;
-  return new Promise((resolve, reject) => {
-    https.get(url, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          resolve(JSON.parse(data));
-        } catch (e) {
-          reject(e);
-        }
-      });
-    }).on('error', reject);
-  });
-});
-
-// ── Report invalid account to server ────────────────────────────────
-ipcMain.handle('report-invalid-account', async (event, { username, key }) => {
-  if (!key) return { success: false, error: 'No key provided' };
-  return new Promise((resolve) => {
-    const url = `https://onajlikezz.xyz/api/clientreport.php?username=${encodeURIComponent(username)}&key=${encodeURIComponent(key)}`;
-    https.get(url, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          resolve(JSON.parse(data));
-        } catch (e) {
-          resolve({ success: false, error: 'Invalid response from report server' });
-        }
-      });
-    }).on('error', (err) => {
-      resolve({ success: false, error: err.message });
+    if (process.platform !== 'win32') return resolve(null);
+    execFile('reg', ['query', key, '/v', value], {
+      windowsHide: true,
+      timeout: 5000,
+    }, (error, stdout) => {
+      if (error) return resolve(null);
+      const match = String(stdout).match(new RegExp(`${value}\\s+REG_SZ\\s+(.+)`, 'i'));
+      return resolve(match ? match[1].trim().replace(/\//g, '\\') : null);
     });
   });
-});
+}
 
-// ── Open folder in file explorer ───────────────────────────────────
-ipcMain.handle('open-folder', async (event, folderPath) => {
-  await shell.openPath(folderPath);
-});
-
-// ── Get random Steam credentials for a game ─────────────────────────
-ipcMain.handle('get-game-credentials', async (event, gameId) => {
-  const key = getSavedKey();
-  const url = `https://onajlikezz.xyz/api/sentgame.php?gameid=${encodeURIComponent(gameId)}&key=${encodeURIComponent(key)}`;
-  return new Promise((resolve, reject) => {
-    https.get(url, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          if (json.Username && json.Password) {
-            resolve({ username: json.Username, password: json.Password });
-          } else {
-            reject(new Error('Invalid credentials response'));
-          }
-        } catch (e) {
-          reject(e);
-        }
-      });
-    }).on('error', reject);
-  });
-});
-
-// ── Test Steam credentials ──────────────────────────────────────────
-ipcMain.handle('test-steam-login', async (event, username, password) => {
-  return new Promise((resolve) => {
-    const client = new SteamUser();
-    let resolved = false;
-    const timeout = setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        client.logOff();
-        resolve({ success: false, error: 'Timeout after 15 seconds', shouldReport: true });
-      }
-    }, 15000);
-
-    client.on('loggedOn', () => {
-      if (!resolved) {
-        resolved = true;
-        clearTimeout(timeout);
-        client.logOff();
-        resolve({ success: true, shouldReport: true });
-      }
-    });
-    client.on('error', (err) => {
-      if (!resolved) {
-        resolved = true;
-        clearTimeout(timeout);
-        client.logOff();
-        let errorMsg = err.message || 'Unknown error';
-        let shouldReport = true;
-
-        if (errorMsg.includes('InvalidPassword')) {
-          errorMsg = 'Invalid password';
-        } else if (errorMsg.includes('AccountLoginDeniedNoMail')) {
-          errorMsg = 'Steam Guard required (cannot bypass)';
-        } else if (errorMsg.includes('AlreadyLoggedInElsewhere') || errorMsg.toLowerCase().includes('already_logged_in')) {
-          errorMsg = 'Already logged in elsewhere (valid account)';
-          shouldReport = false;
-        }
-        resolve({ success: false, error: errorMsg, shouldReport });
-      }
-    });
-    client.logOn({ accountName: username, password: password });
-  });
-});
-
-// ── Launch Steam client with credentials ─────────────────────────
-ipcMain.handle('steam-login', async (event, username, password) => {
-  if (detectedSteamPath) {
-    const steamExe = path.join(detectedSteamPath, 'steam.exe');
-    if (fs.existsSync(steamExe)) {
-      try {
-        if (process.platform === 'win32') {
-          try { execSync('taskkill /F /IM steam.exe /T', { stdio: 'ignore' }); } catch (_) {}
-        } else {
-          try { execSync('pkill -f steam', { stdio: 'ignore' }); } catch (_) {}
-        }
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        const child = spawn(steamExe, ['-login', username, password], {
-          detached: true, stdio: 'ignore', windowsHide: true
-        });
-        child.unref();
-        return { success: true };
-      } catch (err) {
-        console.error('Steam exec launch failed:', err);
-      }
-    }
-  }
-  const steamUrl = `steam://login/${encodeURIComponent(username)}/${encodeURIComponent(password)}`;
-  try {
-    await shell.openExternal(steamUrl);
-    return { success: true };
-  } catch (err) {
-    return { success: false, error: err.message };
-  }
-});
-
-// ── Account Checker handler (hidden but kept) ────────────────────────
-ipcMain.handle('check-account', async (event, username, password) => {
-  return new Promise((resolve) => {
-    const client = new SteamUser();
-    let resolved = false;
-    const timeout = setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        try { client.logOff(); } catch(e) {}
-        resolve(false);
-      }
-    }, 5000);
-
-    client.on('loggedOn', () => {
-      if (!resolved) {
-        resolved = true;
-        clearTimeout(timeout);
-        try { client.logOff(); } catch(e) {}
-        resolve(true);
-      }
-    });
-    client.on('error', () => {
-      if (!resolved) {
-        resolved = true;
-        clearTimeout(timeout);
-        try { client.logOff(); } catch(e) {}
-        resolve(false);
-      }
-    });
-    client.logOn({ accountName: username, password: password });
-  });
-});
-
-// ── Custom path management ──────────────────────────────────────────
-ipcMain.handle('get-custom-paths', () => loadCustomPaths());
-
-ipcMain.handle('set-game-path', async (event, { gameName, customPath }) => {
-  const customs = loadCustomPaths();
-  customs[gameName] = customPath;
-  saveCustomPaths(customs);
-  return { success: true };
-});
-
-ipcMain.handle('remove-custom-path', async (event, gameName) => {
-  const customs = loadCustomPaths();
-  if (customs[gameName]) {
-    delete customs[gameName];
-    saveCustomPaths(customs);
-    return { success: true };
-  }
-  return { success: false, error: 'No custom path set.' };
-});
-
-// ── Folder selection dialog ─────────────────────────────────────────
-ipcMain.handle('select-folder', async () => {
-  const result = await dialog.showOpenDialog(mainWindow, {
-    properties: ['openDirectory'],
-    title: 'Select Game Folder'
-  });
-  if (result.canceled || result.filePaths.length === 0) return null;
-  return result.filePaths[0];
-});
-
-// ── Launch game executable ─────────────────────────────────────────
-ipcMain.handle('launch-game-exe', async (event, { gamePath, exeName }) => {
-  const exePath = path.join(gamePath, exeName);
-  if (!fs.existsSync(exePath)) {
-    return { success: false, error: `Executable not found: ${exeName}` };
-  }
-  try {
-    await shell.openPath(exePath);
-    return { success: true };
-  } catch (e) {
-    return { success: false, error: e.message };
-  }
-});
-
-// ── Helper: read installdir from appmanifest_<id>.acf across all libraries ─
-function getInstallDirFromManifests(steamAppId, libraries) {
-  const manifestName = `appmanifest_${steamAppId}.acf`;
-  for (const lib of libraries) {
-    const manifestPath = path.join(lib, 'steamapps', manifestName);
-    if (!fs.existsSync(manifestPath)) continue;
+function listDrives() {
+  if (process.platform !== 'win32') return ['/'];
+  const drives = [];
+  for (let code = 67; code <= 90; code += 1) {
+    const drive = `${String.fromCharCode(code)}:\\`;
     try {
-      const content = fs.readFileSync(manifestPath, 'utf8');
-      const match = content.match(/"installdir"\s+"([^"]+)"/);
-      if (match && match[1]) {
-        const dirName = match[1].trim();
-        const fullPath = path.join(lib, 'steamapps', 'common', dirName);
-        if (fs.existsSync(fullPath)) return fullPath;
+      if (fs.existsSync(drive)) drives.push(drive);
+    } catch { }
+  }
+  return drives;
+}
+
+async function steamLibraries() {
+  const steamPath = await findSteamPath();
+  const libraries = new Set();
+  if (steamPath) {
+    libraries.add(steamPath);
+    const vdf = path.join(steamPath, 'steamapps', 'libraryfolders.vdf');
+    try {
+      if (fs.existsSync(vdf)) {
+        const content = fs.readFileSync(vdf, 'utf8');
+        const regex = /"path"\s+"([^"]+)"/g;
+        let match;
+        while ((match = regex.exec(content)) !== null) {
+          libraries.add(match[1].replace(/\\\\/g, '\\'));
+        }
       }
-    } catch (e) {
-      console.error(`Failed to read manifest ${manifestName}:`, e);
+    } catch { }
+  }
+  for (const drive of listDrives()) {
+    for (const root of ['SteamLibrary', 'Steam', 'Games\\SteamLibrary', 'Program Files (x86)\\Steam']) {
+      const candidate = path.join(drive, root);
+      try {
+        if (fs.existsSync(path.join(candidate, 'steamapps'))) libraries.add(candidate);
+      } catch { }
     }
+  }
+  return [...libraries];
+}
+
+async function detectGameInstall(appId, executable) {
+  const id = String(appId || '').replace(/[^\d]/g, '').slice(0, 20);
+
+  // Preserve the full relative path, not just the basename
+  const raw = typeof executable === 'string'
+    ? executable.trim().replace(/[\\/]+/g, path.sep)
+    : '';
+  const exe = raw ? path.basename(raw).slice(0, 120) : '';
+  const relExe = raw.slice(0, 260);
+
+  const libraries = await steamLibraries();
+
+  // --- 1. Steam manifest lookup ---
+  for (const library of libraries) {
+    try {
+      const manifest = path.join(library, 'steamapps', `appmanifest_${id}.acf`);
+      if (!id || !fs.existsSync(manifest)) continue;
+      const content = fs.readFileSync(manifest, 'utf8');
+      const match = content.match(/"installdir"\s+"([^"]+)"/i);
+      if (!match) continue;
+
+      const folder = path.join(library, 'steamapps', 'common', match[1].replace(/\\\\/g, '\\'));
+      if (!fs.existsSync(folder)) continue;
+
+      // Prefer the full relative path if it exists
+      if (relExe && fs.existsSync(path.join(folder, relExe))) {
+        return { path: folder, method: 'manifest' };
+      }
+      if (exe && fs.existsSync(path.join(folder, exe))) {
+        return { path: folder, method: 'manifest' };
+      }
+      // Manifest says the game is here — trust it even if the exe check fails
+      return { path: folder, method: 'manifest' };
+    } catch { }
+  }
+
+  if (!exe) return null;
+
+  // --- 2. Scan for the exe in common folders ---
+  for (const library of libraries) {
+    const common = path.join(library, 'steamapps', 'common');
+    try {
+      if (!fs.existsSync(common)) continue;
+      for (const entry of fs.readdirSync(common, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const folder = path.join(common, entry.name);
+
+        if (relExe && fs.existsSync(path.join(folder, relExe))) {
+          return { path: folder, method: 'scan' };
+        }
+        if (fs.existsSync(path.join(folder, exe))) {
+          return { path: folder, method: 'scan' };
+        }
+      }
+    } catch { }
   }
   return null;
 }
 
-// ── Auto‑detect game paths for bypass (using manifests) ──────────────
-ipcMain.handle('get-auto-game-paths', async () => {
-  const games = await loadBypassData();
-  if (!games.length) return {};
-  if (!detectedSteamPath) return {};
+function loadLocations() {
+  try {
+    const file = LOCATIONS_FILE();
+    if (!fs.existsSync(file)) return {};
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
 
-  const libraries = getSteamLibraryFolders(detectedSteamPath);
-  const autoPaths = {};
+function saveLocation(appId, folder) {
+  try {
+    const data = loadLocations();
+    data[String(appId)] = String(folder);
+    fs.mkdirSync(path.dirname(LOCATIONS_FILE()), { recursive: true });
+    fs.writeFileSync(LOCATIONS_FILE(), JSON.stringify(data, null, 2), 'utf8');
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-  for (const game of games) {
-    const id = game.steamAppId;
-    if (!id) continue;
-
-    const manifestPath = getInstallDirFromManifests(id, libraries);
-    if (manifestPath) {
-      autoPaths[id] = manifestPath;
+function parseArguments(value) {
+  if (typeof value !== 'string' || !value.trim()) return [];
+  if (value.length > 500 || value.includes(String.fromCharCode(0))) {
+    throw new Error('Launch arguments are invalid.');
+  }
+  const args = [];
+  let current = '';
+  let quoted = false;
+  let backslashes = 0;
+  for (const character of value.trim()) {
+    if (character === '\\') { backslashes += 1; continue; }
+    if (character === '"') {
+      current += '\\'.repeat(Math.floor(backslashes / 2));
+      if (backslashes % 2 === 1) current += '"';
+      else quoted = !quoted;
+      backslashes = 0;
       continue;
     }
+    current += '\\'.repeat(backslashes);
+    backslashes = 0;
+    if (/\s/.test(character) && !quoted) {
+      if (current) { args.push(current); current = ''; }
+    } else {
+      current += character;
+    }
+  }
+  current += '\\'.repeat(backslashes);
+  if (quoted) throw new Error('Launch arguments contain an unmatched quote.');
+  if (current) args.push(current);
+  if (args.length > 32 || args.some((argument) => argument.length > 260)) {
+    throw new Error('Too many or overly long launch arguments.');
+  }
+  return args;
+}
 
-    const folderName = game.folderName || game.name;
-    if (!folderName) continue;
-    for (const lib of libraries) {
-      const commonPath = path.join(lib, 'steamapps', 'common', folderName);
-      if (fs.existsSync(commonPath)) {
-        autoPaths[id] = commonPath;
-        break;
+function resolveLaunchTarget(folder, executable, location) {
+  if (!validText(folder, 500)) return { error: 'A valid game folder is required.' };
+  const root = path.resolve(folder);
+  const configured = typeof location === 'string' && location.trim()
+    ? location.trim().replace(/^[\\/]+/, '')
+    : (typeof executable === 'string' ? executable.trim() : '');
+  if (!validText(configured, 260)) return { error: 'No launch file is configured.' };
+  if (path.isAbsolute(configured) || /^[a-zA-Z]:/.test(configured) || configured.startsWith('\\\\')) {
+    return { error: 'The launch file must be relative to the game folder.' };
+  }
+  const normalized = path.normalize(configured.replace(/[\\/]+/g, path.sep));
+  if (normalized === '..' || normalized.startsWith(`..${path.sep}`)) {
+    return { error: 'The launch file cannot leave the game folder.' };
+  }
+  const target = path.resolve(root, normalized);
+  const relative = path.relative(root, target);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    return { error: 'The launch file is outside the selected game folder.' };
+  }
+  const extension = path.extname(target).toLowerCase();
+  if (!['.exe', '.bat', '.cmd'].includes(extension)) {
+    return { error: 'Only .exe, .bat, and .cmd launch files are supported.' };
+  }
+  return { root, target, extension };
+}
+
+function startDetached(command, args, cwd) {
+  const child = spawn(command, args, {
+    cwd,
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: false,
+    shell: false,
+  });
+  child.on('error', (err) => {
+    console.error('spawn error:', err);
+    throw err;
+  });
+  child.unref();
+}
+
+async function launchGame(options) {
+  const input = options && typeof options === 'object' ? options : {};
+  const appId = String(input.appId || '').replace(/[^\d]/g, '').slice(0, 20);
+  const resolved = resolveLaunchTarget(input.folder, input.executable, input.location);
+  let args = [];
+
+  if (!resolved.error) {
+    if (!fs.existsSync(resolved.target)) {
+      return { ok: false, code: 'TARGET_NOT_FOUND', error: 'The configured launch file was not found.' };
+    }
+    try {
+      args = parseArguments(input.arguments);
+      if (resolved.extension === '.exe') {
+        startDetached(resolved.target, args, path.dirname(resolved.target));
+      } else {
+        const commandProcessor = process.env.ComSpec || 'C:\\Windows\\System32\\cmd.exe';
+        startDetached(commandProcessor, ['/d', '/s', '/c', resolved.target, ...args], path.dirname(resolved.target));
       }
+      return { ok: true, method: 'direct', target: path.basename(resolved.target) };
+    } catch (error) {
+      return { ok: false, code: 'LAUNCH_FAILED', error: error.message };
     }
   }
 
-  return autoPaths;
+  if (appId && (!validText(input.folder, 500) || (!input.location && !input.executable))) {
+    try {
+      await shell.openExternal(`steam://rungameid/${appId}`);
+      return { ok: true, method: 'steam' };
+    } catch (error) {
+      return { ok: false, code: 'STEAM_FAILED', error: error.message };
+    }
+  }
+
+  return { ok: false, code: 'INVALID_TARGET', error: resolved.error };
+}
+
+app.setAsDefaultProtocolClient('nightlight');
+
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  });
+
+  app.whenReady().then(() => {
+    session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+    session.defaultSession.setPermissionCheckHandler(() => false);
+    const window = createWindow();
+    window.on('maximize', sendWindowState);
+    window.on('unmaximize', sendWindowState);
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
+  }).catch((error) => {
+    console.error('Nightlight startup failed:', error);
+    dialog.showErrorBox('Nightlight startup failed', error.message);
+    app.quit();
+  });
+}
+
+// ---------- IPC: Steam / window / app ----------
+ipcMain.handle('nightlight:steam-path-get', async (event) => {
+  if (!senderIsMain(event)) return '';
+  const resolved = await findSteamPath();
+  return resolved || '';
 });
 
-// ── Bypass Injection (no backup, no revert) ─────────────────────────
-ipcMain.handle('start-bypass', async (event, { steamAppId, gamePath }) => {
-  const zipUrl = getBypassDownloadUrl(steamAppId);
-  if (!zipUrl) return { success: false, error: 'No access key available' };
-
-  const tempDir = path.join(os.tmpdir(), `nightlight-bypass-${Date.now()}`);
-  const zipPath = path.join(tempDir, `${steamAppId}.zip`);
-
+ipcMain.handle('nightlight:steam-path-set', async (event, newPath) => {
+  if (!senderIsMain(event)) return false;
   try {
-    fs.mkdirSync(tempDir, { recursive: true });
-    event.sender.send('bypass-progress', { percent: 0, message: 'Downloading bypass...' });
-    await downloadFile(zipUrl, zipPath, (pct) => {
-      event.sender.send('bypass-progress', { percent: Math.floor(pct * 0.5), message: `Downloading (${pct}%)` });
-    });
+    fs.mkdirSync(path.dirname(STEAM_PATH_FILE()), { recursive: true });
+    fs.writeFileSync(STEAM_PATH_FILE(), String(newPath).trim(), 'utf8');
+    steamPathPromise = null;
+    return true;
+  } catch (e) {
+    return false;
+  }
+});
 
-    event.sender.send('bypass-progress', { percent: 50, message: 'Extracting...' });
-    extractZip(zipPath, tempDir);
+ipcMain.handle('nightlight:window', (event, action) => {
+  if (!senderIsMain(event)) return false;
+  if (action === 'minimize') mainWindow.minimize();
+  else if (action === 'toggleMaximize') mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize();
+  else if (action === 'close') mainWindow.close();
+  else return false;
+  return true;
+});
 
-    const extractedFiles = [];
-    function walk(dir, base = '') {
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        const full = path.join(dir, entry.name);
-        const rel = path.join(base, entry.name);
-        if (entry.isDirectory()) walk(full, rel);
-        else if (full !== zipPath) extractedFiles.push({ fullPath: full, relativePath: rel });
+ipcMain.handle('nightlight:app-info', (event) => senderIsMain(event) ? ({
+  version: app.getVersion(),
+  platform: process.platform,
+  isDev: !app.isPackaged,
+  endpoint: APP_URL,
+}) : null);
+
+ipcMain.handle('nightlight:open-external', async (event, value) => {
+  if (!senderIsMain(event) || !isAllowedExternalUrl(value)) return false;
+  await shell.openExternal(value);
+  return true;
+});
+
+ipcMain.handle('nightlight:retry-connection', (event) => senderIsMain(event) && retryConnection());
+
+ipcMain.handle('nightlight:steam-open', async (event) => {
+  if (!senderIsMain(event)) return false;
+  const steamPath = await findSteamPath();
+  try {
+    if (steamPath && fs.existsSync(path.join(steamPath, 'steam.exe'))) {
+      startDetached(path.join(steamPath, 'steam.exe'), [], steamPath);
+    } else {
+      await shell.openExternal('steam://open/main');
+    }
+    return true;
+  } catch {
+    return false;
+  }
+});
+
+ipcMain.handle('nightlight:windows-security-exclusions', async (event) => {
+  if (!senderIsMain(event) || process.platform !== 'win32') return false;
+  try {
+    await shell.openExternal('windowsdefender://threatsettings');
+    return true;
+  } catch {
+    try {
+      startDetached('explorer.exe', ['windowsdefender://threatsettings'], process.env.SystemRoot || 'C:\\Windows');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+});
+
+ipcMain.handle('nightlight:machine-guid', async (event) => {
+  if (!senderIsMain(event)) return '';
+  return getMachineGuid();
+});
+
+ipcMain.handle('nightlight:steam-info', async (event) => senderIsMain(event) ? ({
+  steamPath: await findSteamPath(),
+  libraries: await steamLibraries(),
+}) : null);
+
+ipcMain.handle('nightlight:detect-game', async (event, appId, executable) => {
+  if (!senderIsMain(event)) return null;
+  return detectGameInstall(appId, executable);
+});
+
+ipcMain.handle('nightlight:select-folder', async (event) => {
+  if (!senderIsMain(event)) return '';
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: 'Select the game installation folder',
+    properties: ['openDirectory'],
+  });
+  return result.canceled ? '' : (result.filePaths[0] || '');
+});
+
+ipcMain.handle('nightlight:validate-folder', (event, folder, executable) => {
+  if (!senderIsMain(event) || !validText(folder, 500)) {
+    return { ok: false, exists: false, reason: 'invalid_input' };
+  }
+
+  if (!fs.existsSync(folder)) {
+    return { ok: false, exists: false, reason: 'folder_missing' };
+  }
+
+  const raw = typeof executable === 'string'
+    ? executable.trim().replace(/[\\/]+/g, path.sep)
+    : '';
+  if (!raw) {
+    return { ok: true, exists: true, executable: '', reason: 'no_exe_configured' };
+  }
+
+  const baseName = path.basename(raw);
+  const fullPath = path.join(folder, raw);
+  const basePath = path.join(folder, baseName);
+
+  // 1. Exact relative path match (e.g. "Binaries/Win64/Game.exe")
+  if (fs.existsSync(fullPath)) {
+    return { ok: true, exists: true, found: fullPath, reason: 'full_match' };
+  }
+
+  // 2. Just the basename in the root folder
+  if (baseName && fs.existsSync(basePath)) {
+    return { ok: true, exists: true, found: basePath, reason: 'basename_match' };
+  }
+
+  // 3. Recursive search up to 4 levels deep (case-insensitive on Windows)
+  const needle = baseName.toLowerCase();
+  const searched = [];
+  let found = null;
+
+  const search = (dir, depth) => {
+    if (found || depth > 4) return;
+    searched.push(dir);
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (found) return;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        search(full, depth + 1);
+      } else if (entry.name.toLowerCase() === needle) {
+        found = full;
+        return;
       }
     }
-    walk(tempDir);
+  };
+  search(folder, 0);
 
-    const totalFiles = extractedFiles.length;
-    for (let i = 0; i < totalFiles; i++) {
-      const { fullPath: src, relativePath: rel } = extractedFiles[i];
-      const dest = path.join(gamePath, rel);
-      const percent = 50 + Math.floor((i / totalFiles) * 50);
-      event.sender.send('bypass-progress', { percent, message: `Installing ${rel} (${i+1}/${totalFiles})` });
+  if (found) {
+    return { ok: true, exists: true, found, reason: 'recursive_match' };
+  }
 
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      fs.copyFileSync(src, dest);
-    }
+  console.warn(`[validate-folder] "${needle}" not found under "${folder}". Searched:`, searched.slice(0, 20));
+  return { ok: false, exists: true, reason: 'not_found', needle, searchedCount: searched.length };
+});
 
-    fs.writeFileSync(path.join(gamePath, 'bypass_applied.txt'), 'true');
+ipcMain.handle('nightlight:locations-get', (event) => senderIsMain(event) ? loadLocations() : {});
+ipcMain.handle('nightlight:location-set', (event, appId, folder) => {
+  if (!senderIsMain(event) || !String(appId || '').slice(0, 20) || !validText(folder, 500)) return false;
+  return saveLocation(String(appId).slice(0, 20), folder);
+});
+ipcMain.handle('nightlight:launch-game', (event, options) => {
+  if (!senderIsMain(event)) return { ok: false, error: 'Unauthorized request.' };
+  return launchGame(options);
+});
 
-    fs.rmSync(tempDir, { recursive: true, force: true });
-    event.sender.send('bypass-progress', { percent: 100, message: 'Bypass applied.' });
-    return { success: true };
+// ============================================================
+// WINDOWS DEFENDER EXCLUSIONS — UAC flow + nl.winexc marker
+// ============================================================
+
+ipcMain.handle('open-folder', async (event, folderPath) => {
+  if (!senderIsMain(event)) return false;
+  if (typeof folderPath !== 'string' || !folderPath) return false;
+  try {
+    const err = await shell.openPath(folderPath);
+    return !err; // shell.openPath returns '' on success, error string on failure
+  } catch {
+    return false;
+  }
+});
+
+ipcMain.handle('nightlight:get-windows-exclusion-status', (event, folderPath) => {
+  if (!senderIsMain(event)) return { exists: false, isAdmin: false };
+  if (process.platform !== 'win32') return { exists: false, isAdmin: false };
+  if (!validText(folderPath, 500)) return { exists: false, isAdmin: false };
+
+  const exists = hasExclusionMarker(folderPath);
+  return { exists, isAdmin: true };
+});
+
+ipcMain.handle('nightlight:add-windows-exclusion', async (event, folderPath) => {
+  if (!senderIsMain(event)) return { ok: false, error: 'unauthorized' };
+  if (process.platform !== 'win32') return { ok: false, error: 'unsupported' };
+  if (!validText(folderPath, 500)) return { ok: false, error: 'invalid_folder' };
+
+  if (!fs.existsSync(folderPath)) {
+    return { ok: false, error: 'folder_not_found' };
+  }
+
+  const escaped = folderPath.replace(/'/g, "''");
+  const script = `Add-MpPreference -ExclusionPath '${escaped}'`;
+
+  const result = await runElevatedPowerShell(script);
+  if (!result.ok) return result;
+
+  // Only write the marker AFTER the exclusion was actually added.
+  const markerWritten = writeExclusionMarker(folderPath);
+  return { ok: true, marker: markerWritten };
+});
+
+ipcMain.handle('nightlight:remove-windows-exclusion', async (event, folderPath) => {
+  if (!senderIsMain(event)) return { ok: false, error: 'unauthorized' };
+  if (process.platform !== 'win32') return { ok: false, error: 'unsupported' };
+  if (!validText(folderPath, 500)) return { ok: false, error: 'invalid_folder' };
+
+  const escaped = folderPath.replace(/'/g, "''");
+  // SilentlyContinue so we don't error if the path isn't in Defender's list
+  const script = `Remove-MpPreference -ExclusionPath '${escaped}' -ErrorAction SilentlyContinue`;
+
+  const result = await runElevatedPowerShell(script);
+  if (!result.ok) return result;
+
+  removeExclusionMarker(folderPath);
+  return { ok: true };
+});
+
+// ============================================================
+// Steam login / zip handling / file helpers
+// ============================================================
+const { checkAccount } = require('./steamChecker.js');
+
+ipcMain.handle('nightlight:try-steam-login', async (event, username, password) => {
+  if (!senderIsMain(event)) return { status: 'error', message: 'Unauthorized' };
+  if (typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
+    return { status: 'error', message: 'Invalid credentials' };
+  }
+  try {
+    const result = await checkAccount(username, password);
+    return { status: result.status, message: result.message || '' };
   } catch (err) {
-    event.sender.send('bypass-progress', { percent: 100, message: `Error: ${err.message}` });
-    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
-    return { success: false, error: err.message };
+    return { status: 'error', message: err.message };
   }
 });
 
-// ── Verify bypass (re‑downloads and reapplies files) ────────────────
-ipcMain.handle('verify-bypass', async (event, { steamAppId, gamePath }) => {
-  const zipUrl = getBypassDownloadUrl(steamAppId);
-  if (!zipUrl) return { success: false, error: 'No access key available' };
-
-  const tempDir = path.join(os.tmpdir(), `nightlight-verify-${Date.now()}`);
-  const zipPath = path.join(tempDir, `${steamAppId}.zip`);
-  try {
-    fs.mkdirSync(tempDir, { recursive: true });
-    event.sender.send('bypass-progress', { percent: 0, message: 'Downloading for verification...' });
-    await downloadFile(zipUrl, zipPath, (pct) => {
-      event.sender.send('bypass-progress', { percent: Math.floor(pct * 0.5), message: `Downloading (${pct}%)` });
+ipcMain.handle('nightlight:steam-login-account', async (event, username, password) => {
+  if (!senderIsMain(event)) return { ok: false, error: 'Unauthorized' };
+  if (typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
+    return { ok: false, error: 'Invalid credentials' };
+  }
+  if (process.platform === 'win32') {
+    await new Promise((resolve) => {
+      execFile('taskkill', ['/F', '/IM', 'steam.exe'], { windowsHide: true, timeout: 10000 }, () => resolve());
     });
-    event.sender.send('bypass-progress', { percent: 50, message: 'Extracting...' });
-    extractZip(zipPath, tempDir);
-    const walk = (dir, base = '') => {
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        const full = path.join(dir, entry.name);
-        const rel = path.join(base, entry.name);
-        if (entry.isDirectory()) walk(full, rel);
-        else if (full !== zipPath) {
-          const dest = path.join(gamePath, rel);
-          fs.mkdirSync(path.dirname(dest), { recursive: true });
-          fs.copyFileSync(full, dest);
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  const steamPath = await findSteamPath();
+  if (!steamPath) {
+    return { ok: false, error: 'Could not locate Steam installation.' };
+  }
+  const steamExe = path.join(steamPath, 'steam.exe');
+  try {
+    startDetached(steamExe, ['-login', username, password], steamPath);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+async function writeFileWithRetry(destPath, data, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      fs.mkdirSync(path.dirname(destPath), { recursive: true });
+      if (fs.existsSync(destPath)) {
+        try { fs.chmodSync(destPath, 0o666); } catch (e) {}
+        try { fs.unlinkSync(destPath); } catch (e) {}
+      }
+      fs.writeFileSync(destPath, data, { flag: 'w' });
+      return;
+    } catch (error) {
+      if (attempt === retries) throw error;
+      await new Promise(resolve => setTimeout(resolve, 200 * attempt));
+    }
+  }
+}
+
+ipcMain.handle('nightlight:file-exists', (event, filePath) => {
+  if (!senderIsMain(event)) return false;
+  try { return fs.existsSync(filePath); } catch { return false; }
+});
+
+async function handleZipDownloadAndExtract(event, url, folder, password, progressId) {
+  if (!senderIsMain(event)) return { ok: false, error: 'Unauthorized' };
+  if (!validText(folder, 500)) return { ok: false, error: 'Invalid folder' };
+
+  if (!password) {
+    try {
+      const urlObj = new URL(url);
+      const basename = path.basename(urlObj.pathname);
+      if (basename.toLowerCase().endsWith('.zip')) password = basename.slice(0, -4);
+    } catch { }
+  }
+
+  const sendProgress = (percent, downloaded, total) => {
+    if (progressId && event.sender && !event.sender.isDestroyed()) {
+      event.sender.send(`nightlight:download-progress-${progressId}`, { percent, downloaded, total });
+    }
+  };
+
+  try {
+    const fsExtra = require('fs-extra');
+    const StreamZip = require('node-stream-zip');
+    const temp = require('temp').track();
+
+    const tempFile = temp.path({ suffix: '.zip' });
+    const fileStream = fs.createWriteStream(tempFile);
+
+    const response = await new Promise((resolve, reject) => {
+      const proto = url.startsWith('https') ? require('https') : require('http');
+      let redirectCount = 0;
+      const handleResponse = (resp) => {
+        if (resp.statusCode >= 300 && resp.statusCode < 400 && resp.headers.location) {
+          if (redirectCount >= 5) return reject(new Error('Too many redirects'));
+          redirectCount++;
+          const redirectUrl = new URL(resp.headers.location, url).toString();
+          proto.get(redirectUrl, handleResponse).on('error', reject);
+          return;
         }
+        if (resp.statusCode !== 200) return reject(new Error(`Download failed with status ${resp.statusCode}`));
+        resolve(resp);
+      };
+      proto.get(url, handleResponse).on('error', reject);
+    });
+
+    const totalSize = parseInt(response.headers['content-length'] || '0', 10);
+    let downloadedSize = 0;
+
+    response.on('data', (chunk) => {
+      downloadedSize += chunk.length;
+      fileStream.write(chunk);
+      if (totalSize > 0) {
+        const percent = Math.min(100, Math.round((downloadedSize / totalSize) * 100));
+        sendProgress(percent, downloadedSize, totalSize);
+      } else {
+        sendProgress(-1, downloadedSize, 0);
       }
+    });
+
+    await new Promise((resolve, reject) => {
+      response.on('end', resolve);
+      response.on('error', reject);
+      fileStream.on('finish', resolve);
+      fileStream.on('error', reject);
+    });
+
+    fileStream.close();
+    sendProgress(100, totalSize || downloadedSize, totalSize || downloadedSize);
+
+    let zip, entries;
+    try {
+      zip = new StreamZip.async({ file: tempFile, password: password || undefined });
+      entries = await zip.entries();
+    } catch (err) {
+      if (password) {
+        await zip?.close();
+        zip = new StreamZip.async({ file: tempFile });
+        entries = await zip.entries();
+      } else throw err;
+    }
+
+    await fsExtra.ensureDir(folder);
+    let extractedCount = 0, errorCount = 0, lastError = null;
+
+    for (const entry of Object.values(entries)) {
+      if (entry.isDirectory) continue;
+      const destPath = path.join(folder, entry.name);
+      try {
+        const data = await zip.entryData(entry);
+        if (fs.existsSync(destPath)) {
+          try { fs.renameSync(destPath, destPath + '.backup'); }
+          catch (e) { try { fs.copyFileSync(destPath, destPath + '.backup'); } catch(err) {} }
+        }
+        await writeFileWithRetry(destPath, data);
+        extractedCount++;
+      } catch (error) {
+        errorCount++;
+        lastError = error;
+        console.error(`Failed to extract ${entry.name}: ${error.message}`);
+      }
+    }
+
+    await zip.close();
+    await fsExtra.unlink(tempFile);
+
+    if (errorCount > 0 && extractedCount === 0) {
+      return { ok: false, error: `All files failed to extract. Last error: ${lastError?.message}` };
+    }
+
+    try { await fsExtra.writeFile(path.join(folder, 'nl.bypass'), ''); }
+    catch (e) { console.error('Could not write marker file:', e.message); }
+
+    return {
+      ok: true,
+      warning: errorCount > 0 ? `${errorCount} file(s) could not be extracted (${lastError?.message})` : undefined
     };
-    walk(tempDir);
-    fs.rmSync(tempDir, { recursive: true, force: true });
-    event.sender.send('bypass-progress', { percent: 100, message: 'Verification complete.' });
-    return { success: true };
-  } catch (err) {
-    event.sender.send('bypass-progress', { percent: 100, message: `Error: ${err.message}` });
-    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
-    return { success: false, error: err.message };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+ipcMain.handle('nightlight:download-extract-zip', (event, url, folder, password) => {
+  return handleZipDownloadAndExtract(event, url, folder, password, null);
+});
+
+ipcMain.handle('nightlight:download-extract-zip-progress', (event, url, folder, password, progressId) => {
+  return handleZipDownloadAndExtract(event, url, folder, password, progressId);
+});
+
+ipcMain.handle('nightlight:check-steam-tool', (event, steamPath) => {
+  if (!senderIsMain(event) || typeof steamPath !== 'string') return { installed: false, version: 'Unknown' };
+  try {
+    const dllPath = path.join(steamPath, 'OpenSteamTool.dll');
+    const verPath = path.join(steamPath, 'st_version.txt');
+    const installed = fs.existsSync(dllPath);
+    let version = 'Unknown';
+    if (fs.existsSync(verPath)) version = fs.readFileSync(verPath, 'utf8').trim();
+    return { installed, version };
+  } catch(e) { return { installed: false, version: 'Unknown' }; }
+});
+
+ipcMain.handle('nightlight:write-file', async (event, destPath, content) => {
+  if (!senderIsMain(event) || typeof destPath !== 'string') return false;
+  try { await writeFileWithRetry(destPath, content); return true; }
+  catch (e) { return false; }
+});
+
+ipcMain.handle('nightlight:write-lua', async (event, steamPath, appId, content) => {
+  if (!senderIsMain(event) || typeof steamPath !== 'string') return false;
+  try {
+    const luaDir = path.join(steamPath, 'config', 'lua');
+    const target = path.join(luaDir, `${appId}.lua`);
+    await writeFileWithRetry(target, content);
+    return true;
+  } catch (e) { return false; }
+});
+
+// ============================================================
+// IN-APP KEY WINDOW
+// ============================================================
+ipcMain.handle('nightlight:open-key-window', async (event) => {
+  if (!senderIsMain(event)) return false;
+  try {
+    if (keyWindow && !keyWindow.isDestroyed()) {
+      if (keyWindow.isMinimized()) keyWindow.restore();
+      keyWindow.focus();
+      return true;
+    }
+
+    const keySession = session.fromPartition('persist:nightlight-key');
+
+    keyWindow = new BrowserWindow({
+      width: 960,
+      height: 880,
+      minWidth: 720,
+      minHeight: 620,
+      parent: mainWindow || undefined,
+      backgroundColor: '#0b061a',
+      autoHideMenuBar: true,
+      title: 'Get Access Key — Nightlight',
+      icon: path.join(__dirname, 'assets', 'icon.png'),
+      webPreferences: {
+        preload: path.join(__dirname, 'preload-key.js'),
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: false,
+        devTools: !app.isPackaged,
+        spellcheck: false,
+        session: keySession,
+        partition: 'persist:nightlight-key',
+        webSecurity: true,
+      },
+    });
+
+    keyWindow.webContents.setWindowOpenHandler(({ url }) => {
+      if (isAllowedExternalUrl(url)) shell.openExternal(url).catch(() => {});
+      return { action: 'deny' };
+    });
+
+    keyWindow.on('closed', () => { keyWindow = null; });
+
+    const machineGuid = await getMachineGuid();
+    const url = `https://nl.onajlikezz.xyz/key/?in_app=1&machine=${encodeURIComponent(machineGuid || '')}&_=${Date.now()}`;
+
+    keyWindow.loadURL(url).catch((err) => {
+      console.error('Key window failed to load:', err);
+      if (keyWindow && !keyWindow.isDestroyed()) {
+        keyWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(`
+          <html><body style="background:#0b061a;color:#e9d5ff;font-family:system-ui;padding:40px;text-align:center">
+            <h2>Could not open the key page</h2>
+            <p style="color:#a5a0c0">${String(err && err.message || err).replace(/</g,'&lt;')}</p>
+            <p style="color:#a5a0c0">Open it in your browser instead:<br>
+              <a style="color:#c084fc" href="https://nl.onajlikezz.xyz/key/">https://nl.onajlikezz.xyz/key/</a>
+            </p>
+          </body></html>
+        `)}`);
+      }
+    });
+
+    return true;
+  } catch (e) {
+    console.error('open-key-window error:', e);
+    return false;
   }
 });
+
+ipcMain.on('nightlight:key-window-return', (event, key) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win && win === keyWindow && !win.isDestroyed()) win.close();
+
+  if (
+    typeof key === 'string' &&
+    key.length > 0 &&
+    key.length < 200 &&
+    mainWindow &&
+    !mainWindow.isDestroyed()
+  ) {
+    mainWindow.webContents.send('nightlight:key-received', key);
+  }
+});
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit();
+});
+
+process.on('uncaughtException', (error) => console.error('Nightlight main process error:', error));
+process.on('unhandledRejection', (error) => console.error('Nightlight main process rejection:', error));
